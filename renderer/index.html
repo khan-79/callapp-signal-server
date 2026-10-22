@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>CallApp</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- JOIN SCREEN -->
+  <div id="join-screen" class="screen">
+    <div class="join-card">
+      <h1>CallApp</h1>
+      <p class="subtitle">Group video &amp; audio calls, anywhere.</p>
+
+      <label>Your name</label>
+      <input id="name-input" type="text" placeholder="e.g. Alex" maxlength="40" />
+
+      <label>Room code</label>
+      <input id="room-input" type="text" placeholder="e.g. team-standup" maxlength="60" />
+
+      <label>Signaling server URL</label>
+      <input id="server-input" type="text" placeholder="https://your-server.example.com" />
+
+      <div class="join-actions">
+        <button id="join-btn" class="primary-btn">Join / Create Room</button>
+      </div>
+      <p id="join-error" class="error-text"></p>
+    </div>
+  </div>
+
+  <!-- CALL SCREEN -->
+  <div id="call-screen" class="screen hidden">
+    <div class="call-header">
+      <span id="room-label"></span>
+      <button id="copy-room-btn" title="Copy room code">Copy Room Code</button>
+    </div>
+
+    <div id="video-grid" class="video-grid"></div>
+
+    <div class="controls">
+      <button id="toggle-mic-btn" class="control-btn">Mute</button>
+      <button id="toggle-cam-btn" class="control-btn">Camera Off</button>
+      <button id="toggle-chat-btn" class="control-btn">Chat</button>
+      <button id="leave-btn" class="control-btn leave-btn">Leave</button>
+    </div>
+
+    <div id="chat-panel" class="chat-panel hidden">
+      <div id="chat-messages" class="chat-messages"></div>
+      <div class="chat-input-row">
+        <input id="chat-input" type="text" placeholder="Type a message…" maxlength="2000" />
+        <button id="chat-send-btn">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>
