@@ -1,136 +1,89 @@
-# CallApp — Cross-Platform Group Video/Audio Calling
+# CallApp
 
-A desktop app (Windows, Mac, Linux) **and** a mobile-friendly web page for group
-video/audio calls over the internet, built with WebRTC. Peers connect directly to
-each other (mesh); a small signaling server just introduces peers to each other and
-relays chat messages — it never sees your audio/video.
+Private group video and audio calling for a team you control.
 
-**Desktop:** install the built .exe/.dmg/.AppImage.
-**iPhone / Android:** no install needed — just open the signaling server's URL in
-Safari or Chrome (see "Use it on mobile" below). It's the exact same calling code,
-just running as a web page instead of inside Electron.
+- **You create the accounts.** Nobody can sign up. The admin adds users and gives them a username and password.
+- **Call anyone who is online.** Pick a person, tap the phone or camera icon, and they get a ringing screen. Add more people during a call for a group call (up to 8).
+- **Chat and photos.** One-to-one messages that are saved, with photo sharing. A separate chat inside every call.
+- **Works everywhere.** Phones (iPhone and Android) and laptops open the web address in the browser. A Windows, Mac and Linux desktop app is also included.
+- **Big-screen controls.** Tap any person to enlarge them. In a 1:1 call tap your small picture to swap. Flip between front and back camera, switch the camera on and off, mute, mirror your own preview.
 
-**Note on where this was built:** I don't have internet access in this sandbox,
-so I couldn't run `npm install` or actually produce the .exe/.dmg/.deb files for
-you here. Everything below is complete, ready-to-run source code — you'll run
-two commands on your own machine (which does have internet) to install
-dependencies and build the installers.
-
-## What you're getting
+## How it fits together
 
 ```
-callapp/
-├── main.js            Electron main process
-├── preload.js          Preload script
-├── package.json        App + electron-builder config (installer settings)
-├── renderer/            The UI (join screen, video grid, controls, chat)
-│   ├── index.html
-│   ├── style.css
-│   └── renderer.js
-└── server/              Signaling server (deploy this separately, once)
-    ├── server.js
-    └── package.json
+renderer/   the app itself (web page, also used inside the desktop app)
+server/     accounts, ringing, signaling, chat, and it serves renderer/ to browsers
+main.js     desktop app shell (Electron)
 ```
 
-Good for small-to-medium groups (roughly up to 6-8 people per call) since it
-uses a mesh topology — every participant connects directly to every other
-participant. Beyond that, you'd want a media server (SFU) instead — happy to
-build that version if you need bigger calls.
+Video and audio go directly between people (peer to peer). The server only introduces them, stores accounts and chat, and never sees the call itself.
 
-## 1. Deploy the signaling server (do this once)
+## 1. Deploy the server (once)
 
-The signaling server does two jobs now: it relays "hey, connect to this person"
-messages between peers, **and** it serves the call page itself so phones/laptops
-can open it directly in a browser. Any of these work: Render, Railway, Fly.io, a
-$5 DigitalOcean droplet, or your own machine with a port forwarded.
+Everything runs from one server. These steps use Render (free) and Neon (free database).
 
-To run it locally:
+### a) A database so users are never lost
+Render's free disk is erased on every restart, so accounts must live in a database.
+
+1. Go to https://neon.tech, sign up, create a project.
+2. Copy the **connection string** (starts with `postgresql://`).
+
+### b) Put the project on GitHub
+Upload the **whole project folder** (not only `server/`) to one GitHub repository. `node_modules` is not needed.
+
+### c) Create the Render web service
+New + > Web Service > pick your repository, then:
+
+| Setting | Value |
+|---|---|
+| Root Directory | `server` |
+| Build Command | `npm install` |
+| Start Command | `npm start` |
+
+### d) Environment variables (Render > Environment)
+
+| Name | Value |
+|---|---|
+| `DATABASE_URL` | the Neon connection string |
+| `JWT_SECRET` | any long random text (40+ characters) |
+| `ADMIN_USERNAME` | your admin login, for example `admin` |
+| `ADMIN_PASSWORD` | your admin password (6+ characters) |
+| `TURN_URL`, `TURN_USERNAME`, `TURN_CREDENTIAL` | optional, see TURN below |
+
+`ADMIN_PASSWORD` is the source of truth for the admin account: if you forget the password, change this variable and redeploy.
+
+### e) Create users
+Open your Render address, sign in as admin, tap the **shield** icon, and add users. Send each person the web address plus their username and password.
+
+## 2. Using it
+
+- **Phone / laptop:** open the web address, sign in. On a phone use "Add to Home Screen" for a full-screen app.
+- **Desktop app:** build it (below), install it, and on the sign-in screen enter the same web address once.
+- The app must be **open** to receive a call (see Limits).
+- Camera and microphone need **https**. Render provides it automatically.
+
+## 3. Build the desktop installers (optional)
 
 ```bash
-cd server
 npm install
-npm start
+npm start            # run it in development
+npm run dist:win     # .exe, build on Windows
+npm run dist:mac     # .dmg, build on a Mac
+npm run dist:linux   # .AppImage and .deb
 ```
+Installers appear in `dist/`. If `npm install` fails to download Electron on a restricted network, build on another machine and copy only the installer.
 
-It listens on port 3000 by default (or `$PORT`). Once deployed, note its public
-URL, e.g. `https://callapp-signal.onrender.com` — you'll paste this into the
-Electron app when joining a room, and it's also the link you open directly in a
-mobile browser (see below).
+## TURN server (for hard networks)
 
-**Important:** the server reads the `renderer/` folder (one level up from
-`server/`) to serve the call page, so when you deploy, push the **whole project**
-to your Git repo — not just the `server` folder's two files — and set Render's
-"Root Directory" setting to `server` (that just tells Render where to run `npm
-install`/`npm start` from; the `renderer` folder still needs to be present
-alongside it in the same repo).
+Most calls connect directly. Some office, hotel and mobile networks block that and need a relay (TURN). Get credentials from a provider (Metered, Twilio, Xirsys) or run coturn, then set `TURN_URL` (for example `turn:your.host:3478`), `TURN_USERNAME`, `TURN_CREDENTIAL` on Render. Clients pick this up automatically, no rebuild needed.
 
-## 2. Run the app in development
+## Limits worth knowing
 
-```bash
-cd callapp        # the root folder, not server/
-npm install
-npm start
-```
+- **Incoming calls only ring while the app is open** (browser tab or desktop app, phone unlocked). Ringing a closed or locked phone needs push notifications, which this version does not include.
+- **Group size:** calls are peer to peer, so every person sends video to every other person. It works well up to about 4 to 6 people and is capped at 8. Bigger meetings need a media server.
+- **Free Render sleeps** after idle time, so the first load can take up to a minute.
+- Photos are resized to about 1280 pixels before sending to keep chat fast.
 
-This opens the app. Enter your name, a room code (anything — share the same
-code with others to land in the same call), and the signaling server URL from
-step 1. First person to use a room code creates it; everyone else joins it.
+## Security notes
 
-## Use it on mobile (iPhone & Android) — no install needed
-
-Once the signaling server is deployed (step 1), just open its URL in a mobile
-browser — e.g. `https://callapp-signal.onrender.com` in Safari (iPhone) or Chrome
-(Android). The exact same join screen, video grid, mute/camera controls, and chat
-show up as a normal web page, and a desktop app user and a phone user can be in
-the same room together.
-
-A couple of mobile-specific notes:
-- The page requires **HTTPS** to access the camera/microphone (this is a browser
-  security rule, not something this app controls) — Render and similar hosts give
-  you HTTPS automatically, so this just works once deployed.
-- The browser will ask for camera/mic permission the first time — allow it.
-- For the best experience, add the page to your home screen (Safari: Share →
-  "Add to Home Screen"; Chrome: menu → "Add to Home screen") so it opens full-screen
-  like a regular app.
-
-## 3. Build installers for Windows / Mac / Linux
-
-Still from the `callapp` root folder:
-
-```bash
-npm run dist:win      # produces an .exe installer (NSIS) — build this ON Windows, or via CI
-npm run dist:mac      # produces a .dmg — build this ON a Mac (Apple requires this)
-npm run dist:linux    # produces an .AppImage and .deb
-```
-
-Or `npm run dist` to attempt all three at once (only reliable when run on CI,
-e.g. GitHub Actions with a matrix of windows-latest/macos-latest/ubuntu-latest
-runners — cross-compiling Mac installers from Windows/Linux isn't supported by
-Apple's tooling).
-
-The finished installers land in `callapp/dist/`. Double-click to install, same
-as any commercial app.
-
-## TURN server (important for reliability)
-
-WebRTC needs STUN to work through most home routers, but some networks
-(corporate firewalls, some mobile carriers, hotel wifi) block direct
-peer-to-peer connections entirely. For those cases you need a TURN server,
-which relays the actual media.
-
-The app ships with only free public STUN servers, so calls will work most of
-the time but may occasionally fail to connect between two "difficult" networks.
-To fix that:
-
-1. Run your own TURN server (the `coturn` project is the standard open-source
-   option), or use a hosted TURN provider (Twilio Network Traversal Service,
-   Metered.ca, Xirsys all offer free/cheap tiers).
-2. Open `renderer/renderer.js` and add your TURN credentials to the
-   `ICE_SERVERS` array near the top of the file (there's a commented-out
-   example line already there).
-
-## Notes
-
-- Camera/mic permissions are requested the first time each user joins a call.
-- Mute/camera-off, room-code copy, and a lightweight text chat are included.
-- No accounts or database — rooms exist only as long as people are in them.
+Passwords are stored hashed (bcrypt). Sign-in is rate limited. Changing a password signs that person out everywhere. Users deleted by the admin are disconnected immediately. Keep `JWT_SECRET` and `ADMIN_PASSWORD` private.

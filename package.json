@@ -1,7 +1,7 @@
 {
   "name": "call-app",
-  "version": "1.0.0",
-  "description": "Cross-platform group video and audio calling app",
+  "version": "2.0.0",
+  "description": "CallApp: private group video and audio calling with accounts, chat and photos",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
