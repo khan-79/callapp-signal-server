@@ -1,13 +1,19 @@
 {
-  "name": "call-app-signaling-server",
-  "version": "1.0.0",
-  "description": "Signaling server for CallApp (relays WebRTC offers/answers/ICE candidates and room chat)",
+  "name": "call-app-server",
+  "version": "2.0.0",
+  "description": "CallApp server: accounts, presence, call signaling, chat, and the web client",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.5",
     "socket.io": "^4.7.5"
   }
 }
