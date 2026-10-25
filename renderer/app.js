@@ -5,6 +5,7 @@
   const $ = (id) => document.getElementById(id);
   const U = window.U;
   U.hydrateIcons();
+  U.attachEmoji($('chat-emoji'), $('chat-input'));
 
   const LS = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
@@ -29,6 +30,8 @@
     ice: [],
     incoming: [],
     current: null,
+    editing: null,
+    policy: { deleteAfterSeenMs: 600000, editMs: 900000 },
     requests: { incoming: [], outgoing: [] },
     presence: new Map() // userId -> {online, t}: live updates that may be newer than a fetch in flight
   };
@@ -154,6 +157,7 @@
     setStatus('Connecting…');
     const cfg = await api('/api/config');
     S.ice = cfg.iceServers;
+    S.policy = cfg.messagePolicy || S.policy;
     await refreshAll();
     connectSocket();
     renderChatPane();
@@ -252,6 +256,9 @@
       refreshFriends().catch(() => {});
     });
     s.on('dm-message', onDm);
+    s.on('dm-deleted', onDeleted);
+    s.on('dm-edited', onEdited);
+    s.on('dm-read', onRead);
     s.on('incoming-call', onIncoming);
     s.on('call-cancelled', onCallCancelled);
   }
@@ -437,8 +444,18 @@
     return d;
   }
 
-  function bubbleFor(m) {
-    return U.bubble({ mine: m.fromId === S.me.id, text: m.text, image: m.image, ts: m.createdAt });
+  function bubbleFor(m, showStatus) {
+    const mine = m.fromId === S.me.id;
+    return U.bubble({
+      id: m.id,
+      mine,
+      text: m.text,
+      image: m.image,
+      ts: m.createdAt,
+      edited: !!m.editedAt,
+      status: mine && showStatus ? (m.read ? 'Seen' : 'Delivered') : null,
+      onTap: mine ? () => openMsgMenu(m) : null
+    });
   }
 
   function renderMessages(toBottom) {
@@ -454,10 +471,12 @@
       box.appendChild(b);
     }
     let lastDay = '';
+    const own = list.filter((x) => x.fromId === S.me.id);
+    const lastOwnId = own.length ? own[own.length - 1].id : null;
     for (const m of list) {
       const day = new Date(m.createdAt).toDateString();
       if (day !== lastDay) { box.appendChild(dayDivider(m.createdAt)); lastDay = day; }
-      box.appendChild(bubbleFor(m));
+      box.appendChild(bubbleFor(m, m.id === lastOwnId));
     }
     box.dataset.lastDay = lastDay;
     if (toBottom !== false) box.scrollTop = box.scrollHeight;
@@ -492,7 +511,10 @@
     const list = S.msgs.get(other);
     const isNew = !!list && !list.some((x) => x.id === m.id);
     if (isNew) list.push(m);
-    if (S.active === other && isNew) appendMessage(m);
+    if (S.active === other && isNew) {
+      if (m.fromId === S.me.id) renderMessages(true);
+      else appendMessage(m);
+    }
 
     if (m.fromId !== S.me.id) {
       if (S.active === other && document.visibilityState === 'visible') markRead(other);
@@ -511,11 +533,99 @@
     const input = $('chat-input');
     const text = input.value.trim();
     if (!text && !image) return;
+    if (S.editing !== null && !image) {
+      const editId = S.editing;
+      stopEdit();
+      S.socket.emit('dm-edit', { id: editId, text }, (res) => {
+        if (res && res.error) U.toast(res.error);
+      });
+      return;
+    }
     if (!S.socket || !S.socket.connected) { U.toast('Not connected. Try again in a moment.'); return; }
     S.socket.emit('dm-send', { toUserId: id, text, image: image || null }, (res) => {
       if (res && res.error) U.toast(res.error);
     });
     input.value = '';
+  }
+
+  /* ----- editing and deleting your own messages ----- */
+  let menuMsg = null;
+  let armedDelete = null;
+  const canDelete = (m) => !m.read || Date.now() - m.createdAt <= S.policy.deleteAfterSeenMs;
+  const canEdit = (m) => !m.image && Date.now() - m.createdAt <= S.policy.editMs;
+
+  function openMsgMenu(m) {
+    menuMsg = m;
+    const del = canDelete(m);
+    const edit = canEdit(m);
+    $('sheet-edit').hidden = !edit;
+    $('sheet-delete').hidden = !del;
+    $('sheet-delete').textContent = 'Delete for everyone';
+    $('sheet-note').textContent = !del && !edit
+      ? (m.read ? 'It was seen, so it can no longer be deleted or edited.' : '')
+      : (m.read ? 'Seen. You can still delete it for a few more minutes.' : '');
+    $('msg-sheet').classList.remove('hidden');
+  }
+  function closeMsgMenu() {
+    $('msg-sheet').classList.add('hidden');
+    menuMsg = null;
+    if (armedDelete) { clearTimeout(armedDelete); armedDelete = null; }
+  }
+  function startEdit(m) {
+    S.editing = m.id;
+    $('chat-input').value = m.text;
+    $('edit-bar').hidden = false;
+    $('chat-input').focus();
+  }
+  function stopEdit() {
+    S.editing = null;
+    $('chat-input').value = '';
+    $('edit-bar').hidden = true;
+  }
+  $('edit-cancel').addEventListener('click', stopEdit);
+  $('sheet-cancel').addEventListener('click', closeMsgMenu);
+  $('msg-sheet').addEventListener('click', (e) => { if (e.target.id === 'msg-sheet') closeMsgMenu(); });
+  $('sheet-edit').addEventListener('click', () => {
+    const m = menuMsg;
+    closeMsgMenu();
+    if (m) startEdit(m);
+  });
+  $('sheet-delete').addEventListener('click', () => {
+    const b = $('sheet-delete');
+    if (!armedDelete) {
+      b.textContent = 'Tap again to delete for everyone';
+      armedDelete = setTimeout(() => { armedDelete = null; b.textContent = 'Delete for everyone'; }, 4000);
+      return;
+    }
+    const id = menuMsg && menuMsg.id;
+    closeMsgMenu();
+    if (!id || !S.socket) return;
+    S.socket.emit('dm-delete', { id }, (res) => { if (res && res.error) U.toast(res.error); });
+  });
+
+  function otherOf(ev) { return ev.fromId === S.me.id ? ev.toId : ev.fromId; }
+  async function refreshConvs() {
+    try { S.convs = await api('/api/conversations'); renderContacts(); } catch (e) { /* ignore */ }
+  }
+  function onDeleted(ev) {
+    const other = otherOf(ev);
+    const list = S.msgs.get(other);
+    if (list) S.msgs.set(other, list.filter((x) => x.id !== ev.id));
+    if (S.active === other) renderMessages(false);
+    refreshConvs();
+  }
+  function onEdited(ev) {
+    const other = otherOf(ev);
+    const list = S.msgs.get(other) || [];
+    const m = list.find((x) => x.id === ev.id);
+    if (m) { m.text = ev.text; m.editedAt = ev.editedAt; }
+    if (S.active === other) renderMessages(false);
+    refreshConvs();
+  }
+  function onRead(ev) {
+    const list = S.msgs.get(ev.byUserId);
+    if (list) list.forEach((m) => { if (m.fromId === S.me.id) m.read = true; });
+    if (S.active === ev.byUserId) renderMessages(false);
   }
 
   $('chat-send').addEventListener('click', () => sendDm(null));

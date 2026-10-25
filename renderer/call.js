@@ -14,6 +14,13 @@
     mic: $('c-mic'),
     cam: $('c-cam'),
     flip: $('c-flip'),
+    speaker: $('c-speaker'),
+    min: $('c-min'),
+    miniBar: $('mini-bar'),
+    miniTimer: $('mini-timer'),
+    miniMic: $('mini-mic'),
+    miniLeave: $('mini-leave'),
+    miniExpand: $('mini-expand'),
     chat: $('c-chat'),
     leave: $('c-leave'),
     dot: $('chat-dot'),
@@ -51,7 +58,9 @@
     observer: null,
     wakeLock: null,
     needGesture: false,
-    lastCount: 0
+    lastCount: 0,
+    speakerOn: true,
+    ringing: new Map() // userId -> true, people being rung right now
   };
   try { C.mirror = localStorage.getItem('ca.mirror') === '1'; } catch (e) { /* ignore */ }
 
@@ -253,6 +262,7 @@
     video.playsInline = true;
     video.setAttribute('playsinline', '');
     if (local) video.muted = true; // never hear yourself
+    else video.muted = !C.speakerOn;
 
     const ph = document.createElement('div');
     ph.className = 'ph';
@@ -273,7 +283,7 @@
     root.appendChild(video);
     root.appendChild(ph);
     root.appendChild(tag);
-    root.addEventListener('click', () => onTileClick(id));
+    root.addEventListener('click', () => (el.screen.classList.contains('mini') ? expand() : onTileClick(id)));
     el.stage.appendChild(root);
 
     const tile = { id, root, video, mic };
@@ -302,7 +312,29 @@
   }
 
   function stageIds() {
-    return [...C.peers.keys(), 'local']; // you last, so others come first in the grid
+    // People still being rung come before you; you are always last.
+    const ringing = [...C.ringing.keys()].map((uid) => 'ring-' + uid);
+    return [...C.peers.keys(), ...ringing, 'local'];
+  }
+
+  // Placeholder tile for someone who has been invited but has not answered yet.
+  function addRinging(uid) {
+    if (!C.active || C.ringing.has(uid) || uid === C.me.id) return;
+    if ([...C.peers.values()].some((p) => p.userId === uid)) return;
+    C.ringing.set(uid, true);
+    const u = C.getUser && C.getUser(uid);
+    const tile = makeTile('ring-' + uid, (u ? u.displayName : 'Someone') + ' \u00b7 Calling\u2026', false);
+    tile.root.classList.add('ringing');
+    updateTileState('ring-' + uid);
+    applyLayout();
+  }
+  function removeRinging(uid) {
+    if (!C.ringing.has(uid)) return;
+    C.ringing.delete(uid);
+    const id = 'ring-' + uid;
+    const t = C.tiles.get(id);
+    if (t) { t.root.remove(); C.tiles.delete(id); }
+    applyLayout();
   }
 
   function applyLayout() {
@@ -474,7 +506,11 @@
   function markConnected() {
     if (C.connectedAt) return;
     C.connectedAt = Date.now();
-    const tick = () => { el.timer.textContent = U.fmtDuration(Math.floor((Date.now() - C.connectedAt) / 1000)); };
+    const tick = () => {
+      const t = U.fmtDuration(Math.floor((Date.now() - C.connectedAt) / 1000));
+      el.timer.textContent = t;
+      el.miniTimer.textContent = t;
+    };
     tick();
     C.ticker = setInterval(tick, 1000);
   }
@@ -488,6 +524,11 @@
     el.cam.classList.toggle('off', !camOn);
     el.cam.setAttribute('aria-label', camOn ? 'Turn camera off' : 'Turn camera on');
     el.mirror.classList.toggle('on', C.mirror);
+    U.setIcon(el.speaker, C.speakerOn ? 'speaker' : 'speaker-off');
+    el.speaker.classList.toggle('off', !C.speakerOn);
+    el.speaker.setAttribute('aria-label', C.speakerOn ? 'Turn speaker off' : 'Turn speaker on');
+    U.setIcon(el.miniMic, C.micOn ? 'mic' : 'mic-off', 18);
+    el.miniMic.classList.toggle('off', !C.micOn);
     el.mirror.setAttribute('aria-pressed', C.mirror ? 'true' : 'false');
   }
 
@@ -510,8 +551,11 @@
     C.unread = 0;
     C.connectedAt = 0;
     el.timer.textContent = '';
+    el.miniTimer.textContent = '';
     el.dot.hidden = true;
-    el.screen.classList.remove('hidden');
+    el.screen.classList.remove('hidden', 'mini');
+    C.ringing.clear();
+    applySpeaker();
     document.body.classList.add('in-call');
     makeTile('local', C.me.displayName + ' (You)', true).video.srcObject = C.localStream;
     playVideo(C.tiles.get('local').video);
@@ -549,8 +593,34 @@
     el.panel.classList.add('hidden');
     el.msgs.innerHTML = '';
     el.screen.classList.add('hidden');
+    el.screen.classList.remove('mini');
+    C.ringing.clear();
     document.body.classList.remove('in-call');
     if (wasActive && C.onEnded) C.onEnded();
+  }
+
+  /* ================= speaker and minimize ================= */
+  function applySpeaker() {
+    C.tiles.forEach((t, id) => { if (id !== 'local') t.video.muted = !C.speakerOn; });
+    updateControls();
+  }
+  function toggleSpeaker() {
+    C.speakerOn = !C.speakerOn;
+    applySpeaker();
+    C.toast(C.speakerOn ? 'Speaker on' : 'Speaker off');
+  }
+
+  // Shrinks the call into a floating window so you can use the rest of the app.
+  // The call keeps running; tap the window to return.
+  function minimize() {
+    if (!C.active) return;
+    el.screen.classList.add('mini');
+    applyLayout();
+  }
+  function expand() {
+    if (!C.active) return;
+    el.screen.classList.remove('mini');
+    applyLayout();
   }
 
   /* ================= in-call chat ================= */
@@ -653,7 +723,10 @@
     C.onAddPeople = opts.onAddPeople;
     C.onEnded = opts.onEnded || null;
 
+    socket.on('ringing', (p) => addRinging(p.userId));
+    socket.on('ringing-ended', (p) => removeRinging(p.userId));
     socket.on('peer-joined', (p) => {
+      removeRinging(p.userId);
       if (!C.active || C.peers.has(p.socketId)) return;
       addPeer(p.socketId, p, false);
     });
@@ -687,6 +760,11 @@
   el.flip.addEventListener('click', flipCamera);
   el.leave.addEventListener('click', leave);
   el.add.addEventListener('click', () => { if (C.onAddPeople) C.onAddPeople(); });
+  el.speaker.addEventListener('click', toggleSpeaker);
+  el.min.addEventListener('click', minimize);
+  el.miniExpand.addEventListener('click', expand);
+  el.miniMic.addEventListener('click', toggleMic);
+  el.miniLeave.addEventListener('click', leave);
   el.mirror.addEventListener('click', () => {
     C.mirror = !C.mirror;
     try { localStorage.setItem('ca.mirror', C.mirror ? '1' : '0'); } catch (e) { /* ignore */ }
@@ -703,6 +781,7 @@
     }
   });
   el.close.addEventListener('click', () => el.panel.classList.add('hidden'));
+  U.attachEmoji($('call-chat-emoji'), $('call-chat-input'));
   el.send.addEventListener('click', () => sendCallChat(null));
   el.input.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendCallChat(null); });
   el.attach.addEventListener('click', () => el.file.click());

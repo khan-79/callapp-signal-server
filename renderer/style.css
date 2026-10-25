@@ -21,7 +21,7 @@ html, body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
   font-size: 15px;
   overflow: hidden;
 }
@@ -405,3 +405,71 @@ label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px
 }
 .notify[hidden] { display: none !important; }
 .notify-actions { display: flex; gap: 6px; }
+
+/* ---------- emoji ---------- */
+.emoji-panel {
+  display: grid; grid-template-columns: repeat(10, 1fr); gap: 2px;
+  padding: 6px 8px; max-height: 180px; overflow-y: auto;
+  background: var(--panel); border-top: 1px solid var(--line);
+}
+.emoji-panel.hidden { display: none !important; }
+.emoji-panel button {
+  font-size: 22px; line-height: 1; padding: 6px 0; border: none; border-radius: 8px;
+  background: none; cursor: pointer;
+}
+.emoji-panel button:hover { background: rgba(255,255,255,.08); }
+
+/* ---------- message editing and menu ---------- */
+.edit-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 12px; background: #1c2a4d; border-top: 1px solid #2f4a8a; font-size: 13px;
+}
+.edit-bar[hidden] { display: none !important; }
+.msg.own .bubble { cursor: pointer; }
+.msg-status { opacity: .85; }
+.sheet {
+  width: 100%; max-width: 360px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 16px; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+}
+.sheet-btn {
+  padding: 14px; border-radius: 12px; border: none; background: var(--panel2);
+  font-size: 15px; font-weight: 600;
+}
+.sheet-btn:hover { background: #232836; }
+.sheet-btn.danger { color: #ff7b7f; }
+.sheet-btn[hidden] { display: none !important; }
+.sheet-note { font-size: 12px; color: var(--muted); text-align: center; margin: 2px 8px 6px; min-height: 0; }
+.sheet-note:empty { display: none; }
+
+/* ---------- calls: ringing, minimized, speaker ---------- */
+.tile.ringing { outline: 2px dashed rgba(255,255,255,.25); outline-offset: -2px; }
+.tile.ringing .ph .avatar { animation: ring-pulse 1.4s ease-in-out infinite; }
+@keyframes ring-pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+
+.mini-bar { display: none; }
+#call-screen.mini {
+  top: auto; left: auto; right: 12px; bottom: 12px;
+  width: min(300px, calc(100vw - 24px)); height: min(200px, 34vh);
+  border-radius: 16px; border: 1px solid var(--line);
+  box-shadow: 0 12px 40px rgba(0,0,0,.55); overflow: hidden;
+  z-index: 180;
+}
+#call-screen.mini #call-header,
+#call-screen.mini #call-controls,
+#call-screen.mini #call-chat { display: none; }
+#call-screen.mini #stage { margin: 0; height: 100%; }
+#call-screen.mini .tile { border-radius: 10px; }
+#call-screen.mini .mini-bar {
+  display: flex; position: absolute; top: 0; left: 0; right: 0; z-index: 30;
+  align-items: center; gap: 6px; padding: 6px;
+  background: linear-gradient(rgba(0,0,0,.7), rgba(0,0,0,0));
+}
+.mini-title {
+  flex: 1; min-width: 0; text-align: left; background: none; border: none; color: #fff;
+  display: flex; flex-direction: column; padding: 0 4px;
+}
+.mini-title span:last-child { font-size: 11px; opacity: .75; }
+.cbtn.sm { width: 38px; height: 38px; }
+@media (max-width: 480px) {
+  #call-screen.mini { bottom: 80px; right: 8px; width: calc(100vw - 16px); height: 26vh; }
+}

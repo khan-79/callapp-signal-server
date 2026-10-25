@@ -74,7 +74,12 @@
         </div>
       </header>
       <div id="chat-messages"></div>
+      <div id="edit-bar" class="edit-bar" hidden>
+        <span>Editing message</span>
+        <button id="edit-cancel" class="btn small" type="button">Cancel</button>
+      </div>
       <div class="composer">
+        <button id="chat-emoji" class="icon-btn" type="button" aria-label="Emoji">😊</button>
         <button id="chat-attach" class="icon-btn" type="button" aria-label="Send a photo" data-icon="image"></button>
         <input id="chat-file" type="file" accept="image/*" hidden />
         <input id="chat-input" type="text" placeholder="Message" maxlength="2000" autocomplete="off" />
@@ -89,6 +94,7 @@
   <header id="call-header">
     <div class="call-info"><strong id="call-title"></strong><span id="call-timer"></span></div>
     <div class="call-head-actions">
+      <button id="c-min" class="chip" type="button" data-icon="minimize" data-size="16"> Minimize</button>
       <button id="c-mirror" class="chip" type="button" aria-pressed="false">Mirror</button>
       <button id="c-add" class="chip" type="button" aria-label="Add people" data-icon="user-plus" data-size="18"> Add</button>
     </div>
@@ -100,14 +106,22 @@
     <button id="c-mic" class="cbtn" type="button"></button>
     <button id="c-cam" class="cbtn" type="button"></button>
     <button id="c-flip" class="cbtn" type="button" aria-label="Switch camera" data-icon="flip" hidden></button>
+    <button id="c-speaker" class="cbtn" type="button" aria-label="Speaker"></button>
     <button id="c-chat" class="cbtn" type="button" aria-label="Chat" data-icon="chat"><i id="chat-dot" class="dot" hidden></i></button>
     <button id="c-leave" class="cbtn danger" type="button" aria-label="Leave call" data-icon="phone"></button>
   </footer>
+
+  <div id="mini-bar" class="mini-bar">
+    <button id="mini-expand" class="mini-title" type="button" aria-label="Return to call"><span id="mini-timer"></span><span>Tap to return</span></button>
+    <button id="mini-mic" class="cbtn sm" type="button" aria-label="Mute microphone"></button>
+    <button id="mini-leave" class="cbtn sm danger" type="button" aria-label="Leave call" data-icon="phone"></button>
+  </div>
 
   <aside id="call-chat" class="hidden">
     <header><strong>Chat</strong><button id="call-chat-close" class="icon-btn" type="button" aria-label="Close chat" data-icon="x"></button></header>
     <div id="call-chat-msgs" class="messages"></div>
     <div class="composer">
+      <button id="call-chat-emoji" class="icon-btn" type="button" aria-label="Emoji">😊</button>
       <button id="call-chat-attach" class="icon-btn" type="button" aria-label="Send a photo" data-icon="image"></button>
       <input id="call-chat-file" type="file" accept="image/*" hidden />
       <input id="call-chat-input" type="text" placeholder="Message everyone" maxlength="2000" autocomplete="off" />
@@ -115,6 +129,16 @@
     </div>
   </aside>
 </section>
+
+<!-- ============ MESSAGE MENU ============ -->
+<div id="msg-sheet" class="overlay hidden">
+  <div class="sheet">
+    <button id="sheet-edit" class="sheet-btn" type="button">Edit message</button>
+    <button id="sheet-delete" class="sheet-btn danger" type="button">Delete for everyone</button>
+    <p id="sheet-note" class="sheet-note"></p>
+    <button id="sheet-cancel" class="sheet-btn" type="button">Cancel</button>
+  </div>
+</div>
 
 <!-- ============ INCOMING CALL ============ -->
 <div id="incoming" class="overlay hidden">
