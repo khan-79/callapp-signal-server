@@ -33,12 +33,19 @@ const pwFingerprint = (u) =>
 const signToken = (u) =>
   jwt.sign({ uid: u.id, pv: pwFingerprint(u) }, JWT_SECRET, { expiresIn: '30d' });
 const validImage = (s) => typeof s === 'string' && s.length <= 3000000 && IMG_RE.test(s);
-const cleanText = (s, max) => (typeof s === 'string' ? s.trim().slice(0, max) : '');
+// Counts whole characters (emoji included), so a cut never splits an emoji.
+const clip = (s, max) => Array.from(s).slice(0, max).join('');
+const cleanText = (s, max) => (typeof s === 'string' ? clip(s.trim(), max) : '');
 const cleanName = (s, fallback) => {
-  const v = typeof s === 'string' ? s.trim().replace(/\s+/g, ' ').slice(0, 40) : '';
+  const v = typeof s === 'string' ? clip(s.trim().replace(/\s+/g, ' '), 40) : '';
   return v || fallback;
 };
 const fn = (f) => (typeof f === 'function' ? f : () => {});
+
+// How long a sent message can be deleted or edited.
+// (Overridable with env vars so the tests can use short windows.)
+const DELETE_AFTER_SEEN_MS = Number(process.env.DELETE_AFTER_SEEN_MS) || 10 * 60 * 1000; // unseen: always; seen: for 10 minutes
+const EDIT_MS = Number(process.env.EDIT_MS) || 15 * 60 * 1000;
 
 function iceServers() {
   const list = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
@@ -138,13 +145,15 @@ async function main() {
         );
       } catch (e) {
         // 404/410: the browser or device removed this subscription
-        if (e.statusCode === 404 || e.statusCode === 410) await store.removePushSub(sub.endpoint, uid);
+        if (e.statusCode === 404 || e.statusCode === 410) {
+          await store.removePushSub(sub.endpoint, uid);
+          pushCache.delete(uid);
+        }
         else console.warn('Push failed:', e.statusCode || e.message);
       }
     }
   }
   const pushTo = (uid, payload) => sendPush(uid, payload).catch((e) => console.error('Push error:', e));
-  const hasPushSubs = async (uid) => (await store.listPushSubs(uid)).length > 0;
   const incomingPayload = (call, from) => ({
     callId: call.id,
     video: call.video,
@@ -152,10 +161,20 @@ async function main() {
     with: [...call.participants.values()].map((p) => p.displayName)
   });
 
-  // Accepted friends of a user, as a Set of user ids.
+  // Caches, so inviting someone to a call doesn't wait on the database.
+  // They are cleared whenever friendships or notification subscriptions change.
+  const friendCache = new Map();
+  const pushCache = new Map();
   async function friendSet(uid) {
-    const rels = await store.listRelations(uid);
-    return new Set(rels.filter((r) => r.status === 'accepted').map((r) => r.userId));
+    if (!friendCache.has(uid)) {
+      const rels = await store.listRelations(uid);
+      friendCache.set(uid, new Set(rels.filter((r) => r.status === 'accepted').map((r) => r.userId)));
+    }
+    return friendCache.get(uid);
+  }
+  async function hasPushSubs(uid) {
+    if (!pushCache.has(uid)) pushCache.set(uid, (await store.listPushSubs(uid)).length > 0);
+    return pushCache.get(uid);
   }
   // Send an event to everyone who is currently a friend of uid (online sockets only).
   async function notifyFriends(uid, event, payload) {
@@ -164,6 +183,8 @@ async function main() {
   }
   // Tell both people their friend list or requests changed.
   function refreshFriends(a, b) {
+    friendCache.delete(a);
+    friendCache.delete(b);
     toUser(a, 'friends-changed', {});
     toUser(b, 'friends-changed', {});
   }
@@ -247,7 +268,11 @@ async function main() {
   app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
   app.get('/api/config', auth, (req, res) =>
-    res.json({ iceServers: iceServers(), maxCallSize: MAX_CALL_SIZE })
+    res.json({
+      iceServers: iceServers(),
+      maxCallSize: MAX_CALL_SIZE,
+      messagePolicy: { deleteAfterSeenMs: DELETE_AFTER_SEEN_MS, editMs: EDIT_MS }
+    })
   );
 
   app.get('/api/users', auth, wrap(async (req, res) => {
@@ -275,6 +300,7 @@ async function main() {
     const other = Number(req.params.userId);
     if (!Number.isInteger(other)) return res.status(400).json({ error: 'Bad user.' });
     await store.markRead(req.user.id, other);
+    toUser(other, 'dm-read', { byUserId: req.user.id });
     res.json({ ok: true });
   }));
 
@@ -310,11 +336,13 @@ async function main() {
       p256dh: sub.keys.p256dh,
       auth: sub.keys.auth
     });
+    pushCache.delete(req.user.id);
     res.json({ ok: true });
   }));
 
   app.post('/api/push/unsubscribe', auth, wrap(async (req, res) => {
     await store.removePushSub(String((req.body && req.body.endpoint) || ''), req.user.id);
+    pushCache.delete(req.user.id);
     res.json({ ok: true });
   }));
 
@@ -462,6 +490,8 @@ async function main() {
     }
     kickUser(id);
     await store.deleteUser(id);
+    friendCache.clear();
+    pushCache.clear();
     io.emit('users-changed');
     res.json({ ok: true });
   }));
@@ -573,12 +603,14 @@ async function main() {
         if (!call.pending.has(uid)) return;
         call.pending.delete(uid);
         toCall(call, 'call-no-answer', { userId: uid });
+        toCall(call, 'ringing-ended', { userId: uid });
         cancelRing(uid, call.id, 'missed', fromInfo);
         checkCallEnd(call);
       }, RING_MS);
 
       call.pending.set(uid, { timer, fromUserId: from.user.id, from: fromInfo });
       toUser(uid, 'incoming-call', incomingPayload(call, fromInfo));
+      toCall(call, 'ringing', { userId: uid });
       if (!online) {
         pushTo(uid, {
           type: 'call',
@@ -672,6 +704,49 @@ async function main() {
       }
     });
 
+    /* ---------- edit / delete messages ---------- */
+    socket.on('dm-delete', async (p, ack) => {
+      ack = fn(ack);
+      try {
+        const m = await store.getMessage(Number(p && p.id));
+        if (!m || m.fromId !== me.id) return ack({ error: 'You can only delete your own messages.' });
+        const sinceSent = Date.now() - m.createdAt;
+        if (m.read && sinceSent > DELETE_AFTER_SEEN_MS) {
+          return ack({ error: 'It was already seen, so it can no longer be deleted.' });
+        }
+        await store.deleteMessage(m.id);
+        const ev = { id: m.id, fromId: m.fromId, toId: m.toId };
+        toUser(m.fromId, 'dm-deleted', ev);
+        toUser(m.toId, 'dm-deleted', ev);
+        ack({ ok: true });
+      } catch (e) {
+        console.error(e);
+        ack({ error: 'Could not delete the message.' });
+      }
+    });
+
+    socket.on('dm-edit', async (p, ack) => {
+      ack = fn(ack);
+      try {
+        const m = await store.getMessage(Number(p && p.id));
+        if (!m || m.fromId !== me.id) return ack({ error: 'You can only edit your own messages.' });
+        if (m.image) return ack({ error: 'Photos cannot be edited. Delete it and send it again.' });
+        if (Date.now() - m.createdAt > EDIT_MS) {
+          return ack({ error: 'Messages can only be edited for a short time after sending.' });
+        }
+        const text = cleanText(p.text, 2000);
+        if (!text) return ack({ error: 'The message cannot be empty.' });
+        const updated = await store.editMessage(m.id, text);
+        const ev = { id: m.id, fromId: m.fromId, toId: m.toId, text: updated.text, editedAt: updated.editedAt };
+        toUser(m.fromId, 'dm-edited', ev);
+        toUser(m.toId, 'dm-edited', ev);
+        ack({ ok: true });
+      } catch (e) {
+        console.error(e);
+        ack({ error: 'Could not edit the message.' });
+      }
+    });
+
     /* ---------- calls ---------- */
     socket.on('call-start', async (p, ack) => {
       ack = fn(ack);
@@ -746,6 +821,7 @@ async function main() {
         if (sid !== socket.id) io.to(sid).emit('call-cancelled', { callId: call.id, reason: 'answered-elsewhere' });
       });
       toCall(call, 'call-declined', { userId: me.id });
+      toCall(call, 'ringing-ended', { userId: me.id });
       checkCallEnd(call);
     });
 

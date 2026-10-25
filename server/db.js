@@ -27,7 +27,9 @@ const pubMsg = (m) => ({
   toId: m.toId,
   text: m.text,
   image: m.image || null,
-  createdAt: m.createdAt
+  createdAt: m.createdAt,
+  read: !!m.read,
+  editedAt: m.editedAt || null
 });
 
 /* ------------------------------------------------------------------ */
@@ -179,6 +181,22 @@ async function createFileStore(file) {
       save();
       return pubMsg(m);
     },
+    async getMessage(id) {
+      const m = data.messages.find((x) => x.id === Number(id));
+      return m ? pubMsg(m) : null;
+    },
+    async deleteMessage(id) {
+      data.messages = data.messages.filter((x) => x.id !== Number(id));
+      save();
+    },
+    async editMessage(id, text) {
+      const m = data.messages.find((x) => x.id === Number(id));
+      if (!m) return null;
+      m.text = text;
+      m.editedAt = Date.now();
+      save();
+      return pubMsg(m);
+    },
     async getMessages(a, b, { before, limit = 100 } = {}) {
       let list = data.messages.filter((m) => isPair(m, a, b));
       if (before) list = list.filter((m) => m.id < before);
@@ -251,6 +269,7 @@ async function createPgStore(url) {
     )`);
   await pool.query('CREATE INDEX IF NOT EXISTS messages_from_idx ON messages (from_id, to_id, id)');
   await pool.query('CREATE INDEX IF NOT EXISTS messages_to_idx ON messages (to_id, from_id, id)');
+  await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS relations (
       requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -296,7 +315,9 @@ async function createPgStore(url) {
     toId: r.to_id,
     text: r.body,
     image: r.image || null,
-    createdAt: new Date(r.created_at).getTime()
+    createdAt: new Date(r.created_at).getTime(),
+    read: !!r.read_at,
+    editedAt: r.edited_at ? new Date(r.edited_at).getTime() : null
   });
 
   return {
@@ -418,6 +439,20 @@ async function createPgStore(url) {
         [fromId, toId, text || '', image || null]
       );
       return rowMsg(r.rows[0]);
+    },
+    async getMessage(id) {
+      const r = await pool.query('SELECT * FROM messages WHERE id = $1', [Number(id)]);
+      return r.rows[0] ? rowMsg(r.rows[0]) : null;
+    },
+    async deleteMessage(id) {
+      await pool.query('DELETE FROM messages WHERE id = $1', [Number(id)]);
+    },
+    async editMessage(id, text) {
+      const r = await pool.query(
+        'UPDATE messages SET body = $2, edited_at = NOW() WHERE id = $1 RETURNING *',
+        [Number(id), text]
+      );
+      return r.rows[0] ? rowMsg(r.rows[0]) : null;
     },
     async getMessages(a, b, { before, limit = 100 } = {}) {
       const r = await pool.query(
