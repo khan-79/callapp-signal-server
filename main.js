@@ -17,7 +17,7 @@ function createWindow() {
 
   // Auto-grant camera/microphone permission requests from our own renderer
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    if (permission === 'media') {
+    if (permission === 'media' || permission === 'notifications') {
       callback(true);
     } else {
       callback(false);
@@ -26,6 +26,9 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 }
+
+// Needed so Windows shows CallApp's own notifications (matches build.appId in package.json).
+app.setAppUserModelId('com.example.callapp');
 
 app.whenReady().then(() => {
   createWindow();
