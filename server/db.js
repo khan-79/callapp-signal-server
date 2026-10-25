@@ -13,6 +13,14 @@ const path = require('path');
 
 const MAX_FILE_MESSAGES = 3000;
 
+// A friendship/request row seen from one user's side.
+const relView = (rel, uid) => ({
+  userId: rel.requesterId === uid ? rel.addresseeId : rel.requesterId,
+  status: rel.status, // 'pending' | 'accepted'
+  outgoing: rel.requesterId === uid,
+  createdAt: rel.createdAt
+});
+
 const pubMsg = (m) => ({
   id: m.id,
   fromId: m.fromId,
@@ -26,12 +34,15 @@ const pubMsg = (m) => ({
 /* JSON file backend                                                   */
 /* ------------------------------------------------------------------ */
 async function createFileStore(file) {
-  let data = { users: [], messages: [], nextUserId: 1, nextMsgId: 1 };
+  let data = { users: [], messages: [], relations: [], pushSubs: [], settings: {}, nextUserId: 1, nextMsgId: 1 };
   try {
     Object.assign(data, JSON.parse(fs.readFileSync(file, 'utf8')));
   } catch (e) {
     if (e.code !== 'ENOENT') console.warn('Could not read', file, e.message);
   }
+  if (!Array.isArray(data.relations)) data.relations = [];
+  if (!Array.isArray(data.pushSubs)) data.pushSubs = [];
+  if (!data.settings) data.settings = {};
   fs.mkdirSync(path.dirname(file), { recursive: true });
 
   let timer = null;
@@ -83,6 +94,10 @@ async function createFileStore(file) {
     async updateUser(id, f) {
       const u = data.users.find((x) => x.id === Number(id));
       if (!u) return null;
+      if (f.username !== undefined && f.username !== u.username) {
+        if (data.users.some((x) => x.username === f.username && x.id !== u.id)) throw new Error('USERNAME_TAKEN');
+        u.username = f.username;
+      }
       if (f.displayName !== undefined) u.displayName = f.displayName;
       if (f.passwordHash !== undefined) u.passwordHash = f.passwordHash;
       if (f.isAdmin !== undefined) u.isAdmin = !!f.isAdmin;
@@ -93,10 +108,58 @@ async function createFileStore(file) {
       id = Number(id);
       data.users = data.users.filter((x) => x.id !== id);
       data.messages = data.messages.filter((m) => m.fromId !== id && m.toId !== id);
+      data.relations = data.relations.filter((r) => r.requesterId !== id && r.addresseeId !== id);
+      data.pushSubs = data.pushSubs.filter((p) => p.userId !== id);
       save();
     },
     async countAdmins() {
       return data.users.filter((u) => u.isAdmin).length;
+    },
+
+    async getSetting(k) {
+      return data.settings[k] || null;
+    },
+    async setSetting(k, v) {
+      data.settings[k] = v;
+      save();
+    },
+    async addPushSub({ endpoint, userId, p256dh, auth }) {
+      data.pushSubs = data.pushSubs.filter((x) => x.endpoint !== endpoint);
+      data.pushSubs.push({ endpoint, userId, p256dh, auth });
+      save();
+    },
+    async removePushSub(endpoint, userId) {
+      data.pushSubs = data.pushSubs.filter((x) => !(x.endpoint === endpoint && x.userId === userId));
+      save();
+    },
+    async listPushSubs(uid) {
+      return data.pushSubs.filter((x) => x.userId === uid).map((x) => ({ endpoint: x.endpoint, p256dh: x.p256dh, auth: x.auth }));
+    },
+
+    async getRelation(a, b) {
+      const r = data.relations.find(
+        (x) => (x.requesterId === a && x.addresseeId === b) || (x.requesterId === b && x.addresseeId === a)
+      );
+      return clone(r);
+    },
+    async setRelation(requesterId, addresseeId, status) {
+      const same = (x) =>
+        (x.requesterId === requesterId && x.addresseeId === addresseeId) ||
+        (x.requesterId === addresseeId && x.addresseeId === requesterId);
+      data.relations = data.relations.filter((x) => !same(x));
+      data.relations.push({ requesterId, addresseeId, status, createdAt: Date.now() });
+      save();
+    },
+    async deleteRelation(a, b) {
+      data.relations = data.relations.filter(
+        (x) => !((x.requesterId === a && x.addresseeId === b) || (x.requesterId === b && x.addresseeId === a))
+      );
+      save();
+    },
+    async listRelations(uid) {
+      return data.relations
+        .filter((x) => x.requesterId === uid || x.addresseeId === uid)
+        .map((x) => relView(x, uid));
     },
 
     async addMessage({ fromId, toId, text, image }) {
@@ -188,6 +251,28 @@ async function createPgStore(url) {
     )`);
   await pool.query('CREATE INDEX IF NOT EXISTS messages_from_idx ON messages (from_id, to_id, id)');
   await pool.query('CREATE INDEX IF NOT EXISTS messages_to_idx ON messages (to_id, from_id, id)');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS relations (
+      requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      addressee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status       TEXT NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (requester_id, addressee_id),
+      CHECK (requester_id <> addressee_id)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint   TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      p256dh     TEXT NOT NULL,
+      auth       TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
 
   const rowUser = (r) =>
     r && {
@@ -196,6 +281,13 @@ async function createPgStore(url) {
       displayName: r.display_name,
       passwordHash: r.password_hash,
       isAdmin: r.is_admin,
+      createdAt: new Date(r.created_at).getTime()
+    };
+  const rowRel = (r) =>
+    r && {
+      requesterId: r.requester_id,
+      addresseeId: r.addressee_id,
+      status: r.status,
       createdAt: new Date(r.created_at).getTime()
     };
   const rowMsg = (r) => ({
@@ -241,16 +333,22 @@ async function createPgStore(url) {
     async updateUser(id, f) {
       const sets = [];
       const vals = [];
+      if (f.username !== undefined) { vals.push(f.username); sets.push(`username = $${vals.length}`); }
       if (f.displayName !== undefined) { vals.push(f.displayName); sets.push(`display_name = $${vals.length}`); }
       if (f.passwordHash !== undefined) { vals.push(f.passwordHash); sets.push(`password_hash = $${vals.length}`); }
       if (f.isAdmin !== undefined) { vals.push(!!f.isAdmin); sets.push(`is_admin = $${vals.length}`); }
       if (!sets.length) return this.getUserById(id);
       vals.push(Number(id));
-      const r = await pool.query(
-        `UPDATE users SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`,
-        vals
-      );
-      return rowUser(r.rows[0]);
+      try {
+        const r = await pool.query(
+          `UPDATE users SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`,
+          vals
+        );
+        return rowUser(r.rows[0]);
+      } catch (e) {
+        if (e.code === '23505') throw new Error('USERNAME_TAKEN');
+        throw e;
+      }
     },
     async deleteUser(id) {
       await pool.query('DELETE FROM users WHERE id = $1', [Number(id)]);
@@ -258,6 +356,60 @@ async function createPgStore(url) {
     async countAdmins() {
       const r = await pool.query('SELECT COUNT(*) AS n FROM users WHERE is_admin = TRUE');
       return Number(r.rows[0].n);
+    },
+
+    async getSetting(k) {
+      const r = await pool.query('SELECT value FROM settings WHERE key = $1', [k]);
+      return r.rows[0] ? r.rows[0].value : null;
+    },
+    async setSetting(k, v) {
+      await pool.query('DELETE FROM settings WHERE key = $1', [k]);
+      await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2)', [k, v]);
+    },
+    async addPushSub({ endpoint, userId, p256dh, auth }) {
+      await pool.query('DELETE FROM push_subscriptions WHERE endpoint = $1', [endpoint]);
+      await pool.query(
+        'INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth) VALUES ($1, $2, $3, $4)',
+        [endpoint, userId, p256dh, auth]
+      );
+    },
+    async removePushSub(endpoint, userId) {
+      await pool.query('DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2', [endpoint, userId]);
+    },
+    async listPushSubs(uid) {
+      const r = await pool.query('SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1', [uid]);
+      return r.rows.map((x) => ({ endpoint: x.endpoint, p256dh: x.p256dh, auth: x.auth }));
+    },
+
+    async getRelation(a, b) {
+      const r = await pool.query(
+        'SELECT * FROM relations WHERE (requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1) LIMIT 1',
+        [a, b]
+      );
+      return rowRel(r.rows[0]) || null;
+    },
+    async setRelation(requesterId, addresseeId, status) {
+      await pool.query(
+        'DELETE FROM relations WHERE (requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)',
+        [requesterId, addresseeId]
+      );
+      await pool.query(
+        'INSERT INTO relations (requester_id, addressee_id, status) VALUES ($1, $2, $3)',
+        [requesterId, addresseeId, status]
+      );
+    },
+    async deleteRelation(a, b) {
+      await pool.query(
+        'DELETE FROM relations WHERE (requester_id = $1 AND addressee_id = $2) OR (requester_id = $2 AND addressee_id = $1)',
+        [a, b]
+      );
+    },
+    async listRelations(uid) {
+      const r = await pool.query(
+        'SELECT * FROM relations WHERE requester_id = $1 OR addressee_id = $1',
+        [uid]
+      );
+      return r.rows.map((x) => relView(rowRel(x), uid));
     },
 
     async addMessage({ fromId, toId, text, image }) {

@@ -2,15 +2,17 @@
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const webpush = require('web-push');
 const { Server } = require('socket.io');
 const createStore = require('./db');
 
 const PORT = process.env.PORT || 3000;
 const MAX_CALL_SIZE = 8; // mesh calls get heavy beyond this
-const RING_MS = 45 * 1000;
+const RING_MS = Number(process.env.RING_MS) || 45 * 1000;
 const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
 const IMG_RE = /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
 
@@ -81,9 +83,31 @@ async function bootstrapAdmin(store) {
   }
 }
 
+// Web Push keys. Generated once and stored, so subscriptions survive restarts.
+async function initPush(store) {
+  const env = process.env;
+  let pub = env.VAPID_PUBLIC_KEY;
+  let priv = env.VAPID_PRIVATE_KEY;
+  if (!pub || !priv) {
+    pub = await store.getSetting('vapid_public');
+    priv = await store.getSetting('vapid_private');
+    if (!pub || !priv) {
+      const k = webpush.generateVAPIDKeys();
+      pub = k.publicKey;
+      priv = k.privateKey;
+      await store.setSetting('vapid_public', pub);
+      await store.setSetting('vapid_private', priv);
+      console.log('Created notification keys (stored in the database).');
+    }
+  }
+  webpush.setVapidDetails(env.VAPID_SUBJECT || 'mailto:admin@example.com', pub, priv);
+  return pub;
+}
+
 async function main() {
   const store = await createStore();
   await bootstrapAdmin(store);
+  const pushPublicKey = await initPush(store);
 
   const app = express();
   app.set('trust proxy', 1);
@@ -95,6 +119,54 @@ async function main() {
 
   const online = new Map(); // userId -> Set(socketId)
   const calls = new Map(); // callId -> call
+
+  // ---- Web Push (notifications when the app is closed) ----
+  // PUSH_LOG_FILE is for tests: it records what would be sent instead of sending.
+  const PUSH_LOG = process.env.PUSH_LOG_FILE || null;
+  async function sendPush(uid, payload) {
+    const subs = await store.listPushSubs(uid);
+    for (const sub of subs) {
+      if (PUSH_LOG) {
+        fs.appendFileSync(PUSH_LOG, JSON.stringify({ uid, endpoint: sub.endpoint, payload }) + '\n');
+        continue;
+      }
+      try {
+        await webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          JSON.stringify(payload),
+          { TTL: payload.ttl || 3600, urgency: payload.type === 'call' ? 'high' : 'normal' }
+        );
+      } catch (e) {
+        // 404/410: the browser or device removed this subscription
+        if (e.statusCode === 404 || e.statusCode === 410) await store.removePushSub(sub.endpoint, uid);
+        else console.warn('Push failed:', e.statusCode || e.message);
+      }
+    }
+  }
+  const pushTo = (uid, payload) => sendPush(uid, payload).catch((e) => console.error('Push error:', e));
+  const hasPushSubs = async (uid) => (await store.listPushSubs(uid)).length > 0;
+  const incomingPayload = (call, from) => ({
+    callId: call.id,
+    video: call.video,
+    from: { id: from.id, displayName: from.displayName },
+    with: [...call.participants.values()].map((p) => p.displayName)
+  });
+
+  // Accepted friends of a user, as a Set of user ids.
+  async function friendSet(uid) {
+    const rels = await store.listRelations(uid);
+    return new Set(rels.filter((r) => r.status === 'accepted').map((r) => r.userId));
+  }
+  // Send an event to everyone who is currently a friend of uid (online sockets only).
+  async function notifyFriends(uid, event, payload) {
+    const friends = await friendSet(uid);
+    friends.forEach((fid) => toUser(fid, event, payload));
+  }
+  // Tell both people their friend list or requests changed.
+  function refreshFriends(a, b) {
+    toUser(a, 'friends-changed', {});
+    toUser(b, 'friends-changed', {});
+  }
 
   /* ---------------- HTTP: middleware ---------------- */
   app.use((req, res, next) => {
@@ -179,8 +251,13 @@ async function main() {
   );
 
   app.get('/api/users', auth, wrap(async (req, res) => {
+    const friends = await friendSet(req.user.id);
     const users = await store.listUsers();
-    res.json(users.map((u) => ({ ...publicUser(u), online: online.has(u.id) })));
+    res.json(
+      users
+        .filter((u) => friends.has(u.id))
+        .map((u) => ({ ...publicUser(u), online: online.has(u.id) }))
+    );
   }));
 
   app.get('/api/conversations', auth, wrap(async (req, res) => {
@@ -212,6 +289,97 @@ async function main() {
     }
     const updated = await store.updateUser(req.user.id, { passwordHash: await bcrypt.hash(next, 10) });
     res.json({ ok: true, token: signToken(updated) });
+  }));
+
+  /* ---------------- HTTP: notifications ---------------- */
+  app.get('/api/push/key', auth, (req, res) => res.json({ publicKey: pushPublicKey }));
+
+  app.post('/api/push/subscribe', auth, wrap(async (req, res) => {
+    const sub = (req.body && req.body.subscription) || {};
+    const valid =
+      typeof sub.endpoint === 'string' &&
+      /^https:\/\//.test(sub.endpoint) &&
+      sub.endpoint.length <= 2000 &&
+      !!sub.keys &&
+      typeof sub.keys.p256dh === 'string' &&
+      typeof sub.keys.auth === 'string';
+    if (!valid) return res.status(400).json({ error: 'Invalid notification subscription.' });
+    await store.addPushSub({
+      endpoint: sub.endpoint,
+      userId: req.user.id,
+      p256dh: sub.keys.p256dh,
+      auth: sub.keys.auth
+    });
+    res.json({ ok: true });
+  }));
+
+  app.post('/api/push/unsubscribe', auth, wrap(async (req, res) => {
+    await store.removePushSub(String((req.body && req.body.endpoint) || ''), req.user.id);
+    res.json({ ok: true });
+  }));
+
+  /* ---------------- HTTP: friends ---------------- */
+  app.get('/api/friends', auth, wrap(async (req, res) => {
+    const rels = await store.listRelations(req.user.id);
+    const users = new Map((await store.listUsers()).map((u) => [u.id, u]));
+    const out = { friends: [], incoming: [], outgoing: [] };
+    for (const r of rels) {
+      const u = users.get(r.userId);
+      if (!u) continue;
+      const row = { ...publicUser(u), online: online.has(u.id), createdAt: r.createdAt };
+      if (r.status === 'accepted') out.friends.push(row);
+      else if (r.outgoing) out.outgoing.push(row);
+      else out.incoming.push(row);
+    }
+    const byName = (a, b) => a.displayName.localeCompare(b.displayName);
+    out.friends.sort(byName);
+    out.incoming.sort((a, b) => b.createdAt - a.createdAt);
+    out.outgoing.sort((a, b) => b.createdAt - a.createdAt);
+    res.json(out);
+  }));
+
+  app.post('/api/friends/request', auth, wrap(async (req, res) => {
+    const me = req.user;
+    const username = String((req.body && req.body.username) || '').trim().toLowerCase();
+    if (!username) return res.status(400).json({ error: 'Enter a username.' });
+    const other = await store.getUserByUsername(username);
+    if (!other) return res.status(404).json({ error: 'No user with that username.' });
+    if (other.id === me.id) return res.status(400).json({ error: "That's your own username." });
+
+    const rel = await store.getRelation(me.id, other.id);
+    if (rel && rel.status === 'accepted') return res.status(409).json({ error: 'You are already friends.' });
+    if (rel && rel.requesterId === other.id) {
+      // They already asked you, so this is a yes.
+      await store.setRelation(other.id, me.id, 'accepted');
+      refreshFriends(me.id, other.id);
+      return res.json({ ok: true, status: 'accepted' });
+    }
+    if (rel) return res.status(409).json({ error: 'Request already sent.' });
+
+    await store.setRelation(me.id, other.id, 'pending');
+    refreshFriends(me.id, other.id);
+    toUser(other.id, 'friend-request', { from: publicUser(me) });
+    res.json({ ok: true, status: 'pending' });
+  }));
+
+  app.post('/api/friends/:id/accept', auth, wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const rel = Number.isInteger(id) ? await store.getRelation(req.user.id, id) : null;
+    if (!rel || rel.status !== 'pending' || rel.requesterId !== id) {
+      return res.status(404).json({ error: 'No pending request from that person.' });
+    }
+    await store.setRelation(id, req.user.id, 'accepted');
+    refreshFriends(req.user.id, id);
+    res.json({ ok: true });
+  }));
+
+  // Used to decline a request, cancel one you sent, or remove a friend.
+  app.delete('/api/friends/:id', auth, wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad user.' });
+    await store.deleteRelation(req.user.id, id);
+    refreshFriends(req.user.id, id);
+    res.json({ ok: true });
   }));
 
   /* ---------------- HTTP: admin ---------------- */
@@ -251,6 +419,13 @@ async function main() {
     if (!target) return res.status(404).json({ error: 'User not found.' });
     const b = req.body || {};
     const fields = {};
+    if (b.username !== undefined) {
+      const un = String(b.username).trim().toLowerCase();
+      if (!USERNAME_RE.test(un)) {
+        return res.status(400).json({ error: 'Username must be 3-32 characters: letters, numbers, dot, dash or underscore.' });
+      }
+      fields.username = un;
+    }
     if (b.displayName !== undefined) fields.displayName = cleanName(b.displayName, target.username);
     if (b.password !== undefined && b.password !== '') {
       const pw = String(b.password);
@@ -265,7 +440,13 @@ async function main() {
       }
       fields.isAdmin = !!b.isAdmin;
     }
-    const updated = await store.updateUser(id, fields);
+    let updated;
+    try {
+      updated = await store.updateUser(id, fields);
+    } catch (e) {
+      if (e.message === 'USERNAME_TAKEN') return res.status(409).json({ error: 'That username is already taken.' });
+      throw e;
+    }
     if (fields.passwordHash && id !== req.user.id) kickUser(id); // old sessions are no longer valid
     io.emit('users-changed');
     res.json({ user: publicUser(updated) });
@@ -348,16 +529,38 @@ async function main() {
     if (call.participants.size >= 2) call.everConnected = true;
   }
 
-  function inviteUsers(call, from, ids) {
+  // Cancels a ring on one person. If they have no open connection, the
+  // notification on their device is closed (and a "missed call" note is shown).
+  function cancelRing(uid, callId, reason, fromInfo) {
+    toUser(uid, 'call-cancelled', { callId, reason });
+    if (userSockets(uid).length) return;
+    pushTo(uid, { type: 'cancel', tag: 'call-' + callId });
+    if (reason === 'missed' && fromInfo) {
+      pushTo(uid, {
+        type: 'message',
+        title: 'Missed call',
+        body: 'from ' + fromInfo.displayName,
+        tag: 'missed-' + callId,
+        chat: fromInfo.id,
+        url: '/?chat=' + fromInfo.id,
+        ttl: 3600
+      });
+    }
+  }
+
+  async function inviteUsers(call, from, ids) {
     const result = { ringing: [], offline: [], busy: [], full: [] };
     const inCallUsers = new Set([...call.participants.values()].map((p) => p.userId));
+    const fromInfo = { id: from.user.id, displayName: from.user.displayName };
     for (const uid of ids) {
       if (inCallUsers.has(uid) || call.pending.has(uid)) continue;
       if (call.participants.size + call.pending.size >= MAX_CALL_SIZE) {
         result.full.push(uid);
         continue;
       }
-      if (!userSockets(uid).length) {
+      const online = userSockets(uid).length > 0;
+      // Not open in any browser or app: still ring them if their device has notifications on.
+      if (!online && !(await hasPushSubs(uid))) {
         result.offline.push(uid);
         continue;
       }
@@ -370,17 +573,23 @@ async function main() {
         if (!call.pending.has(uid)) return;
         call.pending.delete(uid);
         toCall(call, 'call-no-answer', { userId: uid });
-        toUser(uid, 'call-cancelled', { callId: call.id, reason: 'missed' });
+        cancelRing(uid, call.id, 'missed', fromInfo);
         checkCallEnd(call);
       }, RING_MS);
 
-      call.pending.set(uid, { timer, fromUserId: from.user.id });
-      toUser(uid, 'incoming-call', {
-        callId: call.id,
-        video: call.video,
-        from: { id: from.user.id, displayName: from.user.displayName },
-        with: [...call.participants.values()].map((p) => p.displayName)
-      });
+      call.pending.set(uid, { timer, fromUserId: from.user.id, from: fromInfo });
+      toUser(uid, 'incoming-call', incomingPayload(call, fromInfo));
+      if (!online) {
+        pushTo(uid, {
+          type: 'call',
+          title: 'Incoming ' + (call.video ? 'video' : 'voice') + ' call',
+          body: fromInfo.displayName + ' is calling you',
+          tag: 'call-' + call.id,
+          requireInteraction: true,
+          ttl: 60,
+          url: '/'
+        });
+      }
       result.ringing.push(uid);
     }
     return result;
@@ -391,7 +600,7 @@ async function main() {
     if (call.participants.size === 0) {
       for (const [uid, p] of call.pending) {
         clearTimeout(p.timer);
-        toUser(uid, 'call-cancelled', { callId: call.id, reason: 'cancelled' });
+        cancelRing(uid, call.id, 'cancelled');
       }
       call.pending.clear();
       calls.delete(call.id);
@@ -422,7 +631,11 @@ async function main() {
     if (!online.has(me.id)) online.set(me.id, new Set());
     const wasOffline = online.get(me.id).size === 0;
     online.get(me.id).add(socket.id);
-    if (wasOffline) io.emit('presence', { userId: me.id, online: true });
+    for (const call of calls.values()) {
+      const p = call.pending.get(me.id);
+      if (p && p.from) socket.emit('incoming-call', incomingPayload(call, p.from));
+    }
+    if (wasOffline) notifyFriends(me.id, 'presence', { userId: me.id, online: true }).catch(console.error);
 
     /* ---------- direct messages ---------- */
     socket.on('dm-send', async (p, ack) => {
@@ -436,9 +649,22 @@ async function main() {
         if (!text && !image) return ack({ error: 'Empty message.' });
         const to = Number.isInteger(toId) ? await store.getUserById(toId) : null;
         if (!to || to.id === me.id) return ack({ error: 'Unknown user.' });
+        const rel = await store.getRelation(me.id, to.id);
+        if (!rel || rel.status !== 'accepted') return ack({ error: 'You can only message friends.' });
         const msg = await store.addMessage({ fromId: me.id, toId, text, image });
         toUser(me.id, 'dm-message', msg);
         toUser(toId, 'dm-message', msg);
+        if (!userSockets(toId).length) {
+          pushTo(toId, {
+            type: 'message',
+            title: me.displayName,
+            body: (text || 'Sent a photo').slice(0, 140),
+            tag: 'dm-' + me.id,
+            chat: me.id,
+            url: '/?chat=' + me.id,
+            ttl: 3600
+          });
+        }
         ack({ ok: true });
       } catch (e) {
         console.error(e);
@@ -447,18 +673,20 @@ async function main() {
     });
 
     /* ---------- calls ---------- */
-    socket.on('call-start', (p, ack) => {
+    socket.on('call-start', async (p, ack) => {
       ack = fn(ack);
       p = p || {};
       if (socket.callId) return ack({ error: 'You are already in a call.' });
-      const ids = [...new Set((Array.isArray(p.toUserIds) ? p.toUserIds : []).map(Number))]
+      const wanted = [...new Set((Array.isArray(p.toUserIds) ? p.toUserIds : []).map(Number))]
         .filter((id) => Number.isInteger(id) && id !== me.id)
         .slice(0, MAX_CALL_SIZE - 1);
-      if (!ids.length) return ack({ error: 'Pick at least one person to call.' });
+      const friends = await friendSet(me.id);
+      const ids = wanted.filter((id) => friends.has(id));
+      if (!ids.length) return ack({ error: 'You can only call your friends.' });
 
       const call = newCall(p.video);
       addParticipant(call, socket, !!p.video);
-      const result = inviteUsers(call, socket, ids);
+      const result = await inviteUsers(call, socket, ids);
       if (!call.pending.size) {
         leaveCall(socket);
         return ack({ error: 'unavailable', ...result });
@@ -466,14 +694,16 @@ async function main() {
       ack({ ok: true, callId: call.id, ...result });
     });
 
-    socket.on('call-invite', (p, ack) => {
+    socket.on('call-invite', async (p, ack) => {
       ack = fn(ack);
       const call = calls.get(socket.callId);
       if (!call || !call.participants.has(socket.id)) return ack({ error: 'You are not in a call.' });
-      const ids = [...new Set(((p && p.toUserIds) || []).map(Number))].filter(
+      const wanted = [...new Set(((p && p.toUserIds) || []).map(Number))].filter(
         (id) => Number.isInteger(id) && id !== me.id
       );
-      ack({ ok: true, ...inviteUsers(call, socket, ids) });
+      const friends = await friendSet(me.id);
+      const ids = wanted.filter((id) => friends.has(id));
+      ack({ ok: true, ...(await inviteUsers(call, socket, ids)) });
     });
 
     socket.on('call-accept', (p, ack) => {
@@ -559,7 +789,7 @@ async function main() {
         set.delete(socket.id);
         if (set.size === 0) {
           online.delete(me.id);
-          io.emit('presence', { userId: me.id, online: false });
+          notifyFriends(me.id, 'presence', { userId: me.id, online: false }).catch(console.error);
         }
       }
     });
