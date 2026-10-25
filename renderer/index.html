@@ -44,11 +44,19 @@
         <span class="me-text"><strong id="me-name"></strong><small id="conn-status">Connecting…</small></span>
       </button>
       <div class="sb-actions">
-        <button id="group-btn" class="icon-btn" type="button" title="New group call" aria-label="New group call" data-icon="user-plus"></button>
+        <button id="friends-btn" class="icon-btn" type="button" title="Friends and requests" aria-label="Friends and requests" data-icon="user-plus"><span id="friends-badge" class="badge-dot" hidden></span></button>
+        <button id="group-btn" class="icon-btn" type="button" title="New group call" aria-label="New group call" data-icon="video"></button>
         <button id="admin-btn" class="icon-btn" type="button" title="Manage users" aria-label="Manage users" data-icon="shield" hidden></button>
         <button id="logout-btn" class="icon-btn" type="button" title="Sign out" aria-label="Sign out" data-icon="logout"></button>
       </div>
     </header>
+    <div id="notify-banner" class="notify" hidden>
+      <span id="notify-text"></span>
+      <span class="notify-actions">
+        <button id="notify-btn" class="btn small primary" type="button">Turn on</button>
+        <button id="notify-later" class="btn small" type="button">Later</button>
+      </span>
+    </div>
     <div class="search-wrap"><input id="search" type="search" placeholder="Search people" autocomplete="off" /></div>
     <ul id="contact-list"></ul>
   </aside>
@@ -130,6 +138,28 @@
       <button id="picker-cancel" class="btn" type="button">Cancel</button>
       <button id="picker-ok" class="btn primary" type="button">Call</button>
     </div>
+  </div>
+</div>
+
+<!-- ============ FRIENDS ============ -->
+<div id="friends-modal" class="overlay hidden">
+  <div class="modal wide">
+    <header class="modal-head"><h2>Friends</h2><button id="friends-close" class="icon-btn" type="button" aria-label="Close" data-icon="x"></button></header>
+
+    <form id="friend-form" class="friend-form" autocomplete="off">
+      <input id="friend-username" type="text" placeholder="Add a friend by username" autocapitalize="none" autocorrect="off" spellcheck="false" />
+      <button class="btn primary" type="submit">Send request</button>
+    </form>
+    <p id="friend-msg" class="error" role="alert"></p>
+
+    <h3>Requests for you</h3>
+    <ul id="req-in" class="admin-list"></ul>
+
+    <h3>Requests you sent</h3>
+    <ul id="req-out" class="admin-list"></ul>
+
+    <h3>Your friends</h3>
+    <ul id="friend-list" class="admin-list"></ul>
   </div>
 </div>
 

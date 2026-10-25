@@ -29,6 +29,7 @@
     ice: [],
     incoming: [],
     current: null,
+    requests: { incoming: [], outgoing: [] },
     presence: new Map() // userId -> {online, t}: live updates that may be newer than a fetch in flight
   };
 
@@ -156,13 +157,16 @@
     await refreshAll();
     connectSocket();
     renderChatPane();
+    syncPush();
+    updateNotifyBanner();
+    openFromLink();
   }
 
   function setStatus(t) { $('conn-status').textContent = t; }
 
   /* ================= data ================= */
-  // A fetch can finish after a live event (message, presence) that is newer than
-  // its data, so merge instead of overwriting.
+  // A fetch can finish after a live event that is newer than its data, so merge
+  // presence instead of overwriting it.
   function applyUsers(users, t0) {
     users.forEach((u) => {
       const o = S.presence.get(u.id);
@@ -179,19 +183,28 @@
     S.convs = merged;
   }
 
-  async function refreshUsers() {
+  // Friends, incoming and outgoing requests. Everything else in the app builds on this.
+  async function refreshFriends() {
     const t0 = Date.now();
-    applyUsers(await api('/api/users'), t0);
+    const data = await api('/api/friends');
+    applyUsers(data.friends, t0);
+    S.requests = { incoming: data.incoming, outgoing: data.outgoing };
+    // If the person you were chatting with is no longer a friend, close that chat.
+    if (S.active !== null && !byId(S.active)) {
+      S.active = null;
+      $('app-screen').classList.remove('show-chat');
+      renderChatPane();
+    }
     renderContacts();
     updateChatHeader();
+    renderRequestBadge();
+    if (!$('friends-modal').classList.contains('hidden')) renderFriendsModal();
   }
+
   async function refreshAll() {
-    const t0 = Date.now();
-    const [users, convs] = await Promise.all([api('/api/users'), api('/api/conversations')]);
-    applyUsers(users, t0);
+    const [convs] = await Promise.all([api('/api/conversations'), refreshFriends()]);
     applyConvs(convs);
     renderContacts();
-    updateChatHeader();
     if (S.active !== null) loadHistory(S.active, true);
   }
 
@@ -231,7 +244,13 @@
         updateChatHeader();
       }
     });
-    s.on('users-changed', () => refreshUsers().catch(() => {}));
+    s.on('users-changed', () => refreshFriends().catch(() => {}));
+    s.on('friends-changed', () => refreshFriends().catch(() => {}));
+    s.on('friend-request', (p) => {
+      U.toast(p.from.displayName + ' sent you a friend request.', 5000);
+      U.Ring.ding();
+      refreshFriends().catch(() => {});
+    });
     s.on('dm-message', onDm);
     s.on('incoming-call', onIncoming);
     s.on('call-cancelled', onCallCancelled);
@@ -272,7 +291,9 @@
     if (!list.length) {
       const li = document.createElement('li');
       li.className = 'empty muted';
-      li.textContent = S.users.length <= 1 ? 'No one else has an account yet.' : 'No matches.';
+      li.textContent = S.users.length === 0
+        ? 'No friends yet. Tap the add-friend icon to send a request.'
+        : 'No matches.';
       ul.appendChild(li);
     }
     for (const u of list) {
@@ -476,6 +497,10 @@
     if (m.fromId !== S.me.id) {
       if (S.active === other && document.visibilityState === 'visible') markRead(other);
       else { conv.unread = (conv.unread || 0) + 1; U.Ring.ding(); }
+      if (isNew) {
+        const who = byId(m.fromId);
+        pageNotify(who ? who.displayName : 'New message', m.text || 'Sent a photo', 'dm-' + other, { chat: other });
+      }
     }
     renderContacts();
   }
@@ -521,6 +546,7 @@
       return;
     }
     S.incoming.push(c);
+    pageNotify('Incoming call', c.from.displayName + ' is calling you', 'call-' + c.callId, null);
     showNextIncoming();
   }
 
@@ -628,6 +654,140 @@
     openPicker('New group call', 'Start video call', new Set(), (ids) => Call.startOutgoing(ids, true));
   });
 
+  /* ================= friends ================= */
+  function renderRequestBadge() {
+    $('friends-badge').hidden = !S.requests.incoming.length;
+  }
+
+  function fillList(ul, items, emptyText, makeRow) {
+    ul.replaceChildren();
+    if (!items.length) {
+      const li = document.createElement('li');
+      li.className = 'empty muted';
+      li.textContent = emptyText;
+      ul.appendChild(li);
+      return;
+    }
+    items.forEach((u) => ul.appendChild(makeRow(u)));
+  }
+
+  function personRow(u, sub, buttons) {
+    const li = document.createElement('li');
+    li.className = 'admin-row';
+    const top = document.createElement('div');
+    top.className = 'admin-top';
+    const info = document.createElement('div');
+    info.className = 'admin-info';
+    const nm = document.createElement('strong');
+    nm.textContent = u.displayName;
+    const un = document.createElement('small');
+    un.className = 'muted';
+    un.textContent = '@' + u.username + (sub ? ' · ' + sub : '');
+    info.appendChild(nm);
+    info.appendChild(un);
+    const acts = document.createElement('div');
+    acts.className = 'admin-actions';
+    buttons.forEach((b) => acts.appendChild(b));
+    top.appendChild(avatarWithDot(u, 36));
+    top.appendChild(info);
+    top.appendChild(acts);
+    li.appendChild(top);
+    return li;
+  }
+
+  function actionBtn(label, cls, onClick) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn small ' + (cls || '');
+    b.textContent = label;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  // Two taps for destructive actions so nothing is removed by accident.
+  function confirmBtn(label, onConfirm) {
+    let armed = null;
+    const b = actionBtn(label, 'danger-text', () => {
+      if (!armed) {
+        b.textContent = 'Tap again to confirm';
+        armed = setTimeout(() => { armed = null; b.textContent = label; }, 4000);
+        return;
+      }
+      clearTimeout(armed);
+      armed = null;
+      b.textContent = label;
+      onConfirm();
+    });
+    return b;
+  }
+
+  async function respond(id, action) {
+    const msg = $('friend-msg');
+    msg.className = 'error';
+    msg.textContent = '';
+    try {
+      if (action === 'accept') await api('/api/friends/' + id + '/accept', { method: 'POST', body: {} });
+      else await api('/api/friends/' + id, { method: 'DELETE' });
+      await refreshFriends();
+    } catch (e) {
+      msg.textContent = e.message;
+    }
+  }
+
+  function renderFriendsModal() {
+    fillList($('req-in'), S.requests.incoming, 'No requests waiting.', (u) =>
+      personRow(u, 'wants to be friends', [
+        actionBtn('Accept', 'primary', () => respond(u.id, 'accept')),
+        actionBtn('Decline', '', () => respond(u.id, 'decline'))
+      ])
+    );
+    fillList($('req-out'), S.requests.outgoing, 'No requests sent.', (u) =>
+      personRow(u, 'request sent', [actionBtn('Cancel', '', () => respond(u.id, 'cancel'))])
+    );
+    fillList($('friend-list'), S.users, 'No friends yet.', (u) =>
+      personRow(u, u.online ? 'Online' : 'Offline', [
+        actionBtn('Call', '', () => {
+          closeFriends();
+          Call.startOutgoing([u.id], true);
+        }),
+        actionBtn('Message', '', () => {
+          closeFriends();
+          openChat(u.id);
+        }),
+        confirmBtn('Remove', () => respond(u.id, 'remove'))
+      ])
+    );
+  }
+
+  function openFriends() {
+    $('friend-msg').textContent = '';
+    $('friend-msg').className = 'error';
+    $('friends-modal').classList.remove('hidden');
+    renderFriendsModal();
+    refreshFriends().catch(() => {});
+  }
+  function closeFriends() { $('friends-modal').classList.add('hidden'); }
+
+  $('friends-btn').addEventListener('click', openFriends);
+  $('friends-close').addEventListener('click', closeFriends);
+  $('friend-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = $('friend-msg');
+    const un = $('friend-username').value.trim();
+    msg.className = 'error';
+    msg.textContent = '';
+    if (!un) return;
+    try {
+      const r = await api('/api/friends/request', { method: 'POST', body: { username: un } });
+      msg.className = 'ok';
+      msg.textContent = r.status === 'accepted' ? 'You are now friends.' : 'Request sent to @' + un.toLowerCase() + '.';
+      $('friend-username').value = '';
+      await refreshFriends();
+    } catch (ex) {
+      msg.textContent = ex.message;
+    }
+  });
+
   /* ================= admin ================= */
   function openAdmin() {
     $('admin-error').textContent = '';
@@ -684,6 +844,11 @@
     const form = document.createElement('form');
     form.className = 'admin-edit hidden';
     form.autocomplete = 'off';
+    const unIn = document.createElement('input');
+    unIn.value = u.username;
+    unIn.placeholder = 'Username (login)';
+    unIn.setAttribute('autocapitalize', 'none');
+    unIn.setAttribute('autocorrect', 'off');
     const dn = document.createElement('input');
     dn.value = u.displayName;
     dn.placeholder = 'Display name';
@@ -705,6 +870,7 @@
     save.textContent = 'Save';
     const msg = document.createElement('p');
     msg.className = 'error';
+    form.appendChild(unIn);
     form.appendChild(dn);
     form.appendChild(pw);
     form.appendChild(adminLbl);
@@ -717,6 +883,8 @@
       e.preventDefault();
       msg.textContent = '';
       const body = { displayName: dn.value, isAdmin: ac.checked };
+      const newUn = unIn.value.trim().toLowerCase();
+      if (newUn !== u.username) body.username = newUn;
       if (pw.value) body.password = pw.value;
       try {
         await api('/api/admin/users/' + u.id, { method: 'PATCH', body });
@@ -800,11 +968,130 @@
     }
   });
 
+  /* ================= notifications ================= */
+  // Three layers: (1) this page shows notifications while it is open in the background,
+  // (2) the service worker (sw.js) shows them when the app is closed, using Web Push,
+  // (3) the desktop app shows them through the operating system.
+  let notifyDismissed = false;
+  const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  const pushSupported = () => isWeb && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
+  function b64ToBytes(b64) {
+    const base = (b64 + '='.repeat((4 - (b64.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(base);
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  }
+
+  async function subscribeForPush() {
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const key = await api('/api/push/key');
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: b64ToBytes(key.publicKey)
+      });
+    }
+    await api('/api/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON() } });
+  }
+
+  // Refresh this device's subscription every time the app opens, if already allowed.
+  function syncPush() {
+    if (pushSupported() && Notification.permission === 'granted') subscribeForPush().catch(() => {});
+  }
+
+  async function turnOnNotifications() {
+    if (!('Notification' in window)) {
+      U.toast('This browser cannot show notifications.');
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') {
+      U.toast('Notifications are blocked. Allow them in your browser settings to get calls and messages.', 6000);
+      updateNotifyBanner();
+      return;
+    }
+    if (pushSupported()) {
+      try {
+        await subscribeForPush();
+        U.toast('Notifications are on. You will get calls and messages even when CallApp is closed.', 5000);
+      } catch (e) {
+        U.toast('Notifications are on while CallApp is open. Background notifications failed: ' + e.message, 6000);
+      }
+    } else {
+      U.toast('Notifications are on while CallApp is open.');
+    }
+    updateNotifyBanner();
+  }
+
+  function updateNotifyBanner() {
+    let msg = null;
+    let canEnable = false;
+    if (S.me && !notifyDismissed) {
+      if (isWeb && isIOS() && !isStandalone()) {
+        msg = 'To get calls and messages when CallApp is closed, tap Share in Safari, choose "Add to Home Screen", then open CallApp from your Home Screen.';
+      } else if ('Notification' in window && Notification.permission === 'default') {
+        msg = "Turn on notifications so you don't miss calls and messages.";
+        canEnable = true;
+      }
+    }
+    $('notify-banner').hidden = !msg;
+    $('notify-text').textContent = msg || '';
+    $('notify-btn').hidden = !canEnable;
+  }
+  $('notify-btn').addEventListener('click', turnOnNotifications);
+  $('notify-later').addEventListener('click', () => {
+    notifyDismissed = true;
+    updateNotifyBanner();
+  });
+
+  // Shows a notification while CallApp is in the background. Does nothing when the
+  // page is visible, because the in-app screens already show it.
+  async function pageNotify(title, body, tag, opts) {
+    if (!document.hidden || !('Notification' in window) || Notification.permission !== 'granted') return;
+    const chat = opts && opts.chat;
+    try {
+      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        const reg = await navigator.serviceWorker.ready;
+        await reg.showNotification(title, {
+          body,
+          tag,
+          renotify: true,
+          data: chat ? { chat, url: '/?chat=' + chat } : { url: '/' }
+        });
+        return;
+      }
+      const n = new Notification(title, { body, tag });
+      n.onclick = () => {
+        window.focus();
+        n.close();
+        if (chat) openChat(chat);
+      };
+    } catch (e) { /* notifications not available here */ }
+  }
+
+  // Tapping a notification opens the app; if it was a message, open that chat.
+  function openFromLink() {
+    const q = new URLSearchParams(location.search);
+    const id = Number(q.get('chat'));
+    if (!id) return;
+    history.replaceState(null, '', location.pathname);
+    if (byId(id)) openChat(id);
+  }
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'open' && e.data.chat && byId(e.data.chat)) openChat(e.data.chat);
+    });
+  }
+
   /* ================= viewer + misc ================= */
   $('viewer').addEventListener('click', () => $('viewer').classList.add('hidden'));
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       $('viewer').classList.add('hidden');
+      closeFriends();
       closePicker();
     }
   });
