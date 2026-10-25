@@ -74,6 +74,16 @@ npm run dist:linux   # .AppImage and .deb
 ```
 Installers appear in `dist/`. If `npm install` fails to download Electron on a restricted network, build on another machine and copy only the installer.
 
+## Messages and calls
+
+- **Edit:** tap your own text message and choose **Edit message**. Allowed for 15 minutes after sending. Photos can't be edited.
+- **Delete for everyone:** tap your own message and choose **Delete for everyone** (tap twice to confirm). Allowed any time until the other person sees it, and for 10 minutes after they've seen it.
+- **Seen:** your last message shows **Delivered** or **Seen**.
+- **Minimize a call** to use the rest of the app while staying on the call. Tap the small window to return.
+- **Speaker** turns the other people's sound on or off on your device. Phones can't change between earpiece and speaker from a web page, so use your phone's own speaker control for that.
+- **Calling tiles:** when you add someone during a call, a "Calling…" tile appears straight away and turns into their video when they answer.
+- **Emoji:** tap the smiley button next to the message box.
+
 ## Notifications
 
 Calls and messages notify people in three ways:
